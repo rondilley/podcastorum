@@ -1,6 +1,8 @@
 """Local podcast transcription using faster-whisper with GPU acceleration."""
 
+import argparse
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -124,11 +126,66 @@ def format_transcript_with_timestamps(segments: list[dict]) -> str:
     return "\n".join(lines)
 
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <audio_file>")
-        sys.exit(1)
+def assess_completeness(jsonl_path: Path) -> tuple[float, int, float]:
+    """Check how complete a JSONL transcription is.
 
-    result = transcribe(sys.argv[1])
-    print("\n--- Transcript ---")
-    print(format_transcript_with_timestamps(result["segments"]))
+    Returns (coverage_ratio, segment_count, total_duration).
+    """
+    if not jsonl_path.exists():
+        return 0.0, 0, 0.0
+
+    info = {}
+    last_segment = None
+    segment_count = 0
+
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            data = json.loads(line)
+            if "_info" in data:
+                info = data["_info"]
+            else:
+                last_segment = data
+                segment_count += 1
+
+    duration = info.get("duration", 0.0)
+    if not last_segment or duration <= 0:
+        return 0.0, segment_count, duration
+
+    coverage = last_segment["end"] / duration
+    return coverage, segment_count, duration
+
+
+def transcribe_in_subprocess(audio_path: str | Path, model_size: str = None,
+                             output_dir: Path = None) -> Path:
+    """Run transcription in a subprocess so exit-code-127 crashes are contained."""
+    audio_path = Path(audio_path)
+    model_size = model_size or config.WHISPER_MODEL
+    output_dir = output_dir or config.OUTPUT_DIR
+
+    jsonl_path = output_dir / f"{audio_path.stem}.segments.jsonl"
+
+    cmd = [
+        sys.executable, __file__,
+        str(audio_path),
+        "--model", model_size,
+        "--output-dir", str(output_dir),
+    ]
+
+    print(f"Starting transcription subprocess...")
+    result = subprocess.run(cmd)
+
+    if result.returncode != 0:
+        print(f"  Whisper process exited with code {result.returncode} (expected near completion)")
+
+    return jsonl_path
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Transcribe audio with faster-whisper")
+    parser.add_argument("audio_file", help="Path to audio file")
+    parser.add_argument("--model", default=None, help="Whisper model size")
+    parser.add_argument("--output-dir", default=None, help="Output directory")
+    args = parser.parse_args()
+
+    output_dir = Path(args.output_dir) if args.output_dir else None
+    transcribe(args.audio_file, model_size=args.model, output_dir=output_dir)
