@@ -1,37 +1,79 @@
-"""Local podcast transcription using faster-whisper with GPU acceleration."""
+"""Local podcast transcription with GPU acceleration.
+
+Supports two backends:
+  - faster-whisper (CTranslate2) — preferred, works on NVIDIA CUDA and AMD ROCm (CTranslate2 v4.7+)
+  - openai-whisper (PyTorch) — fallback, works on any PyTorch-supported device including ROCm
+
+Backend is auto-detected by config.WHISPER_BACKEND.
+"""
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from faster_whisper import WhisperModel
-
 import config
 
 
-def transcribe(audio_path: str | Path, model_size: str = None,
-               output_dir: Path = None) -> dict:
-    """Transcribe an audio file locally using faster-whisper.
+def check_gpu_available() -> None:
+    """Check that the GPU is available and not locked by another process.
 
-    Writes segments incrementally to a JSONL file so progress is not lost
-    if the process is interrupted. Returns a dict with 'text', 'segments',
-    and 'info'.
+    On ROCm systems, /dev/kfd is the GPU device node. If another process
+    holds it exclusively, whisper will segfault instead of giving a useful
+    error. This check catches that before we waste time loading a model.
     """
-    audio_path = Path(audio_path)
-    if not audio_path.exists():
-        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+    if config.WHISPER_DEVICE == "cpu":
+        return
 
-    model_size = model_size or config.WHISPER_MODEL
-    output_dir = output_dir or config.OUTPUT_DIR
-    output_dir.mkdir(exist_ok=True)
+    # Check if /dev/kfd is in use (ROCm systems)
+    kfd = Path("/dev/kfd")
+    if kfd.exists():
+        try:
+            result = subprocess.run(
+                ["fuser", str(kfd)],
+                capture_output=True, text=True, timeout=5,
+            )
+            pids = result.stdout.strip().split()
+            # Exclude our own process tree (subprocess spawns python3
+            # which may touch /dev/kfd during PyTorch import)
+            own_pids = {str(os.getpid()), str(os.getppid())}
+            other_pids = [p for p in pids if p not in own_pids]
+            if other_pids:
+                # Identify what's using the GPU
+                procs = []
+                for pid in other_pids:
+                    try:
+                        comm = Path(f"/proc/{pid}/comm").read_text().strip()
+                        procs.append(f"{comm} (PID {pid})")
+                    except (FileNotFoundError, PermissionError):
+                        procs.append(f"PID {pid}")
+                proc_list = ", ".join(procs)
+                print(
+                    f"Error: GPU is in use by: {proc_list}\n"
+                    f"Whisper needs exclusive GPU access. "
+                    f"Stop the other process(es) or wait for them to finish.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        except FileNotFoundError:
+            pass  # fuser not installed, skip check
+        except subprocess.TimeoutExpired:
+            pass  # fuser hung, skip check
 
-    # Incremental output file
-    jsonl_path = output_dir / f"{audio_path.stem}.segments.jsonl"
 
-    print(f"Loading Whisper model '{model_size}' on {config.WHISPER_DEVICE}...")
+# ---------------------------------------------------------------------------
+# Backend: faster-whisper (CTranslate2)
+# ---------------------------------------------------------------------------
+
+def _transcribe_faster_whisper(audio_path: Path, model_size: str,
+                                jsonl_path: Path) -> dict:
+    """Transcribe using faster-whisper with incremental segment output."""
+    from faster_whisper import WhisperModel
+
+    print(f"Loading Whisper model '{model_size}' on {config.WHISPER_DEVICE} (faster-whisper)...")
     model = WhisperModel(
         model_size,
         device=config.WHISPER_DEVICE,
@@ -53,7 +95,6 @@ def transcribe(audio_path: str | Path, model_size: str = None,
     print(f"Detected language: {info.language} (probability {info.language_probability:.2f})")
     print(f"Duration: {info.duration:.1f}s ({info.duration / 60:.1f} min)")
 
-    # Write info header as first line
     info_dict = {
         "language": info.language,
         "language_probability": info.language_probability,
@@ -76,11 +117,9 @@ def transcribe(audio_path: str | Path, model_size: str = None,
             segments.append(seg_dict)
             full_text_parts.append(segment.text.strip())
 
-            # Write each segment immediately to disk
             f.write(json.dumps(seg_dict) + "\n")
             f.flush()
 
-            # Progress indicator — report every 5%
             pct = int((segment.end / info.duration) * 100) if info.duration > 0 else 0
             pct_bucket = (pct // 5) * 5
             if pct_bucket > last_pct_reported:
@@ -97,6 +136,111 @@ def transcribe(audio_path: str | Path, model_size: str = None,
         "segments": segments,
         "info": info_dict,
     }
+
+
+# ---------------------------------------------------------------------------
+# Backend: openai-whisper (PyTorch)
+# ---------------------------------------------------------------------------
+
+def _transcribe_openai_whisper(audio_path: Path, model_size: str,
+                                jsonl_path: Path) -> dict:
+    """Transcribe using OpenAI whisper (PyTorch backend).
+
+    This backend works on any PyTorch-supported device including ROCm.
+    Unlike faster-whisper, segments are returned all at once after
+    transcription completes (no incremental streaming), but we still
+    write them to JSONL for consistency.
+    """
+    import whisper
+
+    device = config.WHISPER_DEVICE
+    print(f"Loading Whisper model '{model_size}' on {device} (openai-whisper)...")
+    model = whisper.load_model(model_size, device=device)
+
+    print(f"Transcribing: {audio_path.name}")
+    start_time = time.time()
+
+    result = model.transcribe(
+        str(audio_path),
+        beam_size=5,
+        verbose=False,
+    )
+
+    language = result.get("language", "unknown")
+    # OpenAI whisper doesn't provide language probability or duration directly;
+    # estimate duration from the last segment's end time
+    raw_segments = result.get("segments", [])
+    duration = raw_segments[-1]["end"] if raw_segments else 0.0
+
+    print(f"Detected language: {language}")
+    print(f"Duration: {duration:.1f}s ({duration / 60:.1f} min)")
+
+    info_dict = {
+        "language": language,
+        "language_probability": 0.0,
+        "duration": duration,
+    }
+
+    # Write JSONL in same format as faster-whisper backend
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"_info": info_dict}) + "\n")
+        for seg in raw_segments:
+            seg_dict = {
+                "start": seg["start"],
+                "end": seg["end"],
+                "text": seg["text"].strip(),
+            }
+            f.write(json.dumps(seg_dict) + "\n")
+
+    elapsed = time.time() - start_time
+    print(f"Transcription complete in {elapsed:.1f}s ({duration / elapsed:.1f}x realtime)")
+
+    info_dict["transcription_time"] = elapsed
+
+    segments = [
+        {"start": s["start"], "end": s["end"], "text": s["text"].strip()}
+        for s in raw_segments
+    ]
+
+    return {
+        "text": " ".join(s["text"] for s in segments),
+        "segments": segments,
+        "info": info_dict,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def transcribe(audio_path: str | Path, model_size: str = None,
+               output_dir: Path = None) -> dict:
+    """Transcribe an audio file locally using the best available backend.
+
+    Writes segments to a JSONL file so progress is not lost if the
+    process is interrupted. Returns a dict with 'text', 'segments',
+    and 'info'.
+    """
+    audio_path = Path(audio_path)
+    if not audio_path.exists():
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+    model_size = model_size or config.WHISPER_MODEL
+    output_dir = output_dir or config.OUTPUT_DIR
+    output_dir.mkdir(exist_ok=True)
+
+    jsonl_path = output_dir / f"{audio_path.stem}.segments.jsonl"
+
+    backend = config.WHISPER_BACKEND
+    print(f"Using whisper backend: {backend}")
+    print(f"GPU device: {config.WHISPER_DEVICE}")
+
+    check_gpu_available()
+
+    if backend == "faster-whisper":
+        return _transcribe_faster_whisper(audio_path, model_size, jsonl_path)
+    else:
+        return _transcribe_openai_whisper(audio_path, model_size, jsonl_path)
 
 
 def load_segments_from_jsonl(jsonl_path: Path) -> dict:
@@ -181,7 +325,7 @@ def transcribe_in_subprocess(audio_path: str | Path, model_size: str = None,
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Transcribe audio with faster-whisper")
+    parser = argparse.ArgumentParser(description="Transcribe audio with whisper")
     parser.add_argument("audio_file", help="Path to audio file")
     parser.add_argument("--model", default=None, help="Whisper model size")
     parser.add_argument("--output-dir", default=None, help="Output directory")

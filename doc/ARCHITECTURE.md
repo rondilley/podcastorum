@@ -4,13 +4,16 @@
 
 ```mermaid
 graph TD
+    Z[fetcher.py<br/>RSS Discovery + Download] -->|podcasts/*.mp3| A
     A[summarizer.py<br/>CLI + Pipeline] --> B[transcriber.py<br/>Local GPU]
     A --> C[analyzer.py<br/>Multi-LLM]
-    B --> D[faster-whisper<br/>large-v3 / CUDA]
+    B --> D[faster-whisper / openai-whisper<br/>large-v3 / CUDA or ROCm]
     C --> E[Claude<br/>Sonnet 4]
     C --> F[OpenAI<br/>GPT-4.1]
     C --> G[xAI<br/>Grok-3]
     C --> H[Mistral<br/>Large-latest]
+    Z --> Y[(feeds.json)]
+    Z --> X[(.fetch_state.json)]
     D --> I[(segments.jsonl)]
     I --> J[(transcript.md)]
     E & F & G & H --> K[(analysis.md)]
@@ -20,23 +23,38 @@ graph TD
 
 ### config.py
 
-Centralized configuration. Loads API keys from `*.key.txt` files in the project root. Defines Whisper model settings (model size, device, compute type) and directory paths.
+Centralized configuration. Loads API keys from `*.key.txt` files in the project root. Defines Whisper model settings (model size, compute type) and directory paths.
 
 No environment variables -- keys are plain files for simplicity and compatibility with the llm_compare project structure.
 
+**GPU auto-detection.** `detect_gpu_backend()` checks `torch.cuda.is_available()` which returns `True` for both NVIDIA CUDA and AMD ROCm (since ROCm's HIP runtime presents through the CUDA API). Falls back to `"cpu"` if no GPU is available.
+
+**Whisper backend auto-detection.** `detect_whisper_backend()` tries to import `faster_whisper` first (preferred for performance), then falls back to `whisper` (OpenAI's original, broader GPU compatibility). Raises a clear error if neither is installed.
+
 ### transcriber.py
 
-Handles local audio-to-text conversion using faster-whisper (CTranslate2 backend).
+Handles local audio-to-text conversion with two backend options, auto-detected via `config.WHISPER_BACKEND`.
 
-Key design decisions:
+**Backend: faster-whisper (CTranslate2)**
+
+The preferred backend. Supports NVIDIA CUDA and AMD ROCm (CTranslate2 v4.7+). Key characteristics:
 
 - **Incremental JSONL output.** Each transcribed segment is flushed to disk immediately via a JSONL file. This is critical because the whisper process frequently exits with code 127 near completion (likely a CUDA/ctranslate2 cleanup issue). The JSONL file preserves all segments regardless.
-
-- **JSONL format.** Line 1 is a metadata record (`{"_info": {...}}`), followed by one segment per line (`{"start", "end", "text"}`). The `load_segments_from_jsonl()` function reconstructs the full transcript from this file.
-
 - **VAD filtering.** Voice Activity Detection skips silence, reducing processing time and improving transcript quality.
+- **Progress reporting.** Reports every 5% to avoid flooding stdout.
 
-- **Progress reporting.** Reports every 5% to avoid flooding stdout (earlier per-segment `\r` output caused buffer issues in non-terminal contexts).
+**Backend: openai-whisper (PyTorch)**
+
+The fallback backend. Works on any PyTorch-supported GPU including ROCm. Key differences:
+
+- **No incremental output.** All segments are returned at once after transcription completes, then written to JSONL for consistency with the faster-whisper format.
+- **No VAD filtering.** OpenAI's whisper does not have built-in VAD.
+- **2-4x slower** than faster-whisper for the same model and accuracy.
+
+**Common design:**
+
+- **JSONL format.** Both backends write identical output: line 1 is a metadata record (`{"_info": {...}}`), followed by one segment per line (`{"start", "end", "text"}`). The `load_segments_from_jsonl()` function reconstructs the full transcript from either backend's output.
+- **Public API is backend-agnostic.** `transcribe()`, `load_segments_from_jsonl()`, `assess_completeness()`, and `transcribe_in_subprocess()` work identically regardless of backend.
 
 ### analyzer.py
 
@@ -89,6 +107,24 @@ graph TD
 
 All prompts operate under `RON_DILLEY_SYSTEM_PROMPT`, which defines the editorial voice.
 
+### fetcher.py
+
+Podcast discovery and episode download via RSS feeds. Operates independently from the analysis pipeline but can optionally trigger it via `--analyze`.
+
+Key design decisions:
+
+- **RSS auto-discovery.** Given a bare website URL (e.g., `darknetdiaries.com`), the fetcher parses the HTML for `<link rel="alternate" type="application/rss+xml">` tags. If none are found, it probes common RSS paths (`/feed`, `/rss`, `/feed.xml`, `/rss.xml`, `/atom.xml`, `/podcast.xml`, `/feed/podcast`, `/index.xml`). Uses stdlib `html.parser.HTMLParser` to avoid a BeautifulSoup dependency.
+
+- **Two-file state model.** `feeds.json` stores user-managed podcast sources (name, feed URL, website, date added). `.fetch_state.json` stores runtime download state (downloaded GUIDs, file path mappings, last-checked timestamps). Separation keeps the user config clean and the auto-generated state gitignored.
+
+- **GUID-based dedup.** Episodes are identified by their RSS `<guid>` element, which is more stable than titles (which can be edited after publication). The state file tracks all downloaded GUIDs per podcast.
+
+- **Atomic downloads.** Audio files download to a `.part` temp file first, then `rename()` to the final path on completion. Interrupted downloads never leave partial files that could be mistaken for complete episodes.
+
+- **Feed parsing via feedparser.** Handles both `<enclosure>` tags (standard for podcasts) and `<media:content>` elements. Extracts GUID, title, audio URL, publication date, and file size.
+
+- **URL normalization.** All URLs (both `--rss` and website URLs) are normalized with `https://` if no scheme is provided, and HTML responses to `--rss` URLs produce a clear error directing the user to use `add <url>` for auto-discovery instead.
+
 ### summarizer.py
 
 CLI entry point and pipeline orchestrator. Coordinates the two-step flow:
@@ -104,6 +140,10 @@ Builds the transcript markdown document with metadata table, timestamped segment
 
 ```mermaid
 graph TD
+    P[Podcast URL] --> Q[fetcher: discover RSS feed]
+    Q --> R[fetcher: parse feed, filter new episodes]
+    R --> S[fetcher: download to podcasts/]
+    S --> A
     A[podcasts/title.m4a] --> B[transcriber.transcribe]
     B -->|incremental write| C[output/title.segments.jsonl]
     C --> D[build_transcript_md]
@@ -148,6 +188,28 @@ With 4 providers, the analysis pipeline makes:
 | **Total** | **17** | |
 
 All calls are sequential (no concurrency) to keep the implementation simple and avoid rate limiting.
+
+## Fetcher State Model
+
+The fetcher uses two JSON files to separate user configuration from runtime state:
+
+```mermaid
+graph LR
+    subgraph User-Managed
+        F[feeds.json<br/>Podcast sources]
+    end
+    subgraph Auto-Managed
+        S[.fetch_state.json<br/>Download history]
+    end
+    F --> FE[fetcher.py]
+    FE --> S
+    FE -->|new episodes| P[podcasts/]
+    FE -->|--analyze| SU[summarizer.py]
+```
+
+**feeds.json** stores registered podcasts (name, feed URL, website, date added). Managed by `add`/`remove` subcommands.
+
+**.fetch_state.json** tracks per-podcast download state: downloaded GUIDs, file path mappings, and last-checked timestamps. Updated automatically after each successful download. Gitignored.
 
 ## Known Issues
 

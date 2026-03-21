@@ -7,11 +7,11 @@ Transcription runs entirely on local hardware (no audio leaves the machine). The
 ## Requirements
 
 - Python 3.12+
-- NVIDIA GPU with CUDA support (for transcription)
-- PyTorch with CUDA
+- NVIDIA GPU with CUDA **or** AMD GPU with ROCm (for transcription)
+- PyTorch with CUDA or ROCm
 - API keys for one or more LLM providers (Claude, OpenAI, xAI, Mistral)
 
-## Setup
+## Install
 
 ```bash
 pip install -r requirements.txt
@@ -30,18 +30,64 @@ Only the providers with valid key files will be used. The pipeline works with as
 
 ## Usage
 
+### Fetching Podcasts
+
+Use `fetcher.py` to discover, track, and download podcast episodes via RSS:
+
+```bash
+# Add a podcast by website URL (auto-discovers RSS feed)
+python3 fetcher.py add darknetdiaries.com
+
+# Add by direct RSS feed URL
+python3 fetcher.py add --rss "https://feeds.megaphone.fm/darknetdiaries"
+
+# List tracked podcasts and download status
+python3 fetcher.py list
+
+# Download all new (not previously downloaded) episodes
+python3 fetcher.py fetch
+
+# Download only the 3 most recent episodes
+python3 fetcher.py fetch --latest 3
+
+# Download episodes published after a date
+python3 fetcher.py fetch --since 2026-01-01
+
+# Fetch from one specific podcast
+python3 fetcher.py fetch --podcast "Darknet Diaries"
+
+# Fetch new episodes and immediately run the analysis pipeline on them
+python3 fetcher.py fetch --analyze
+
+# Remove a tracked podcast
+python3 fetcher.py remove "Darknet Diaries"
+```
+
+The fetcher tracks downloaded episodes in `.fetch_state.json` so it never re-downloads. Downloads use `.part` temp files for atomic writes — interrupted downloads won't leave corrupt files.
+
+### Analyzing Podcasts
+
 ```bash
 # Full pipeline: transcribe + multi-LLM analysis
-python summarizer.py "podcasts/episode.m4a"
+python3 summarizer.py "podcasts/episode.m4a"
 
 # Skip transcription if already done (uses saved JSONL segments)
-python summarizer.py "podcasts/episode.m4a" --skip-transcribe
+python3 summarizer.py "podcasts/episode.m4a" --skip-transcribe
 
 # Use a smaller Whisper model for faster transcription
-python summarizer.py "podcasts/episode.m4a" --whisper-model medium
+python3 summarizer.py "podcasts/episode.m4a" --whisper-model medium
 ```
 
 Accepts any audio format supported by ffmpeg (m4a, mp3, wav, flac, ogg, etc.).
+
+### Daily Automation
+
+Combine the fetcher with cron for hands-off operation:
+
+```bash
+# Fetch latest episode from all tracked podcasts and analyze it daily at 6 AM
+0 6 * * * cd /path/to/podcastorum && python3 fetcher.py fetch --latest 1 --analyze >> /var/log/podcastorum.log 2>&1
+```
 
 ## Output
 
@@ -57,7 +103,14 @@ All output is written to the `output/` directory:
 
 ### Step 1: Local Transcription
 
-Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) with the `large-v3` model running on CUDA. Segments are written incrementally to a JSONL file so that progress is preserved even if the process is interrupted. VAD (Voice Activity Detection) filtering skips silence automatically.
+Two whisper backends are supported, auto-detected at startup:
+
+| Backend | GPU Support | Performance | Notes |
+|---------|-------------|-------------|-------|
+| [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2) | NVIDIA CUDA, AMD ROCm (v4.7+) | Fastest | Incremental segments, VAD filtering |
+| [openai-whisper](https://github.com/openai/whisper) (PyTorch) | Any PyTorch-supported GPU | 2-4x slower | Broader GPU compatibility |
+
+GPU backend is auto-detected — ROCm's HIP runtime presents through the CUDA API, so the same code path works for both NVIDIA and AMD GPUs. Segments are written incrementally to a JSONL file so that progress is preserved even if the process is interrupted. VAD (Voice Activity Detection) filtering skips silence automatically (faster-whisper only).
 
 ### Step 2: Multi-LLM Editorial Analysis
 
@@ -79,13 +132,16 @@ All output is written in the voice, tone, and style of Ron Dilley -- cybersecuri
 ## Project Structure
 
 ```
-podcast_summarizer/
-    summarizer.py       # CLI entry point, orchestrates the pipeline
+podcastorum/
+    fetcher.py          # Podcast discovery and download via RSS
+    summarizer.py       # CLI entry point, orchestrates the analysis pipeline
     transcriber.py      # Local GPU transcription via faster-whisper
     analyzer.py         # Multi-LLM analysis (independent, adversarial, synthesis)
     config.py           # API key loading, model and device settings
     requirements.txt    # Python dependencies
-    podcasts/           # Input audio files
+    feeds.json          # Tracked podcast sources (created by fetcher)
+    .fetch_state.json   # Download state tracker (auto-managed)
+    podcasts/           # Downloaded/input audio files
     output/             # Generated transcripts and analyses
 ```
 
@@ -102,7 +158,7 @@ podcast_summarizer/
 Override with `--whisper-model`:
 
 ```bash
-python summarizer.py "podcasts/episode.m4a" --whisper-model small
+python3 summarizer.py "podcasts/episode.m4a" --whisper-model small
 ```
 
 ## LLM Providers
